@@ -1,0 +1,550 @@
+\documentclass{ieeeaccess}
+\usepackage{cite}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{graphicx}
+\usepackage{textcomp}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{bm}
+
+\makeatletter
+\AtBeginDocument{\DeclareMathVersion{bold}
+\SetSymbolFont{operators}{bold}{T1}{times}{b}{n}
+\SetSymbolFont{NewLetters}{bold}{T1}{times}{b}{it}
+\SetMathAlphabet{\mathrm}{bold}{T1}{times}{b}{n}
+\SetMathAlphabet{\mathit}{bold}{T1}{times}{b}{it}
+\SetMathAlphabet{\mathbf}{bold}{T1}{times}{b}{n}
+\SetMathAlphabet{\mathtt}{bold}{OT1}{pcr}{b}{n}
+\SetSymbolFont{symbols}{bold}{OMS}{cmsy}{b}{n}
+\renewcommand\boldmath{\@nomath\boldmath\mathversion{bold}}}
+\makeatother
+
+\def\BibTeX{{\rm B\kern-.05em{\sc i\kern-.025em b}\kern-.08em
+    T\kern-.1667em\lower.7ex\hbox{E}\kern-.125emX}}
+
+\begin{document}
+\history{Date of current version June 23, 2026.}
+\doi{10.1109/ACCESS.2026.0000000}
+
+\title{Metric Depth at the Edge: Boundary Residual Refinement for Monocular Depth Estimation}
+\author{\uppercase{Xiangrui Kong}\authorrefmark{1}, \uppercase{Jing Wang}\authorrefmark{1}}
+\address[1]{Xi'an Institute of Applied Optics, Xi'an 710065, China}
+\tfootnote{The authors received no specific funding for this work.}
+
+\markboth
+{Xiangrui Kong \headeretal: Metric Depth at the Edge}
+{Xiangrui Kong \headeretal: Metric Depth at the Edge}
+
+\corresp{Corresponding author: Jing Wang (e-mail: pcoolfy@163.com).}
+
+\begin{abstract}
+Monocular metric depth estimation predicts physical-scale depth from a single RGB image, but object boundaries and occlusion contours can still contain foreground-background mixing and unreliable metric values. This paper proposes BRRH-ZoeDepth, a boundary residual refinement framework for ZoeDepth-style metric depth estimation. The method preserves ZoeDepth as the metric-depth base, predicts geometry-aware depth-discontinuity probabilities, uses a frozen Depth Anything V2 branch as structural guidance, and applies a bounded residual in final log-depth space. This design targets local boundary regions while a non-boundary preservation term discourages global scale disturbance. On KITTI, the 5-epoch BRRH model achieves AbsRel 0.069576, RMSE 2.801930, SILog 9.286570, Boundary RMSE 9.736915, Top5 AbsRel 0.148862, and Band3 AbsRel 0.152965, lowering the main boundary-band metric errors relative to the previous strong boundary-gated variant. On NYU Depth V2, a tuned BRRH configuration preserves global metric accuracy and reports higher Edge F1@3 and Edge F1@5 than the NYU-sync ZoeDepth baseline. Additional boundary-density, alignment-sensitivity, and external-model analyses show that edge localization, boundary-region metric error, and metric-scale calibration are related but distinct evaluation axes. The results support BRRH as a lightweight boundary-aware refinement mechanism rather than a replacement for high-resolution foundation depth models.
+\end{abstract}
+
+\begin{keywords}
+boundary residual refinement, depth discontinuity, KITTI, metric depth, monocular depth estimation, NYU Depth V2, ZoeDepth.
+\end{keywords}
+
+\titlepgskip=-21pt
+
+\maketitle
+
+\section{Introduction}
+\label{sec:introduction}
+\PARstart{D}{epth} estimation is a central component of visual scene understanding because it links two-dimensional images to three-dimensional geometry. Metric monocular depth estimation is especially attractive because it predicts physical-scale depth from a single RGB image without requiring stereo cameras, active depth sensors, or LiDAR at inference time. This capability is valuable for autonomous driving, mobile robotics, augmented reality, and three-dimensional reconstruction. However, monocular depth estimation is intrinsically ill-posed: a single image does not provide explicit disparity, and metric scale must be inferred from visual, semantic, and dataset-specific cues.
+
+Modern depth models have greatly improved global metrics such as AbsRel, RMSE, SILog, and threshold accuracy. ZoeDepth combines relative-depth transfer with metric-depth adaptation \cite{zoedepth}, Depth Anything V2 demonstrates the value of large-scale depth pretraining \cite{dav2}, and Depth Pro emphasizes high-resolution sharp metric depth \cite{depthpro}. Despite this progress, depth discontinuities remain difficult. Object silhouettes, occlusion boundaries, traffic signs, poles, vehicles, and foreground-background intersections often require abrupt depth changes. Standard decoders and global losses may instead produce intermediate depths between foreground and background, leading to blurred contours in depth maps and unrealistic ramps or thick edges in projected point clouds.
+
+Depth discontinuities are not identical to RGB edges. Texture, shadows, and printed patterns can form strong image edges without any geometric depth jump, while low-texture object boundaries can contain real depth discontinuities. Therefore, simply adding image-edge cues or generic gradient losses is insufficient. A boundary-aware metric-depth model should identify geometry-related discontinuities and correct the metric depth prediction in the local region where these discontinuities occur.
+
+The practical consequence is important for driving scenes. A small number of boundary pixels can have limited influence on full-image average metrics, but those pixels determine whether a foreground vehicle is separated cleanly from the road or background, whether a pole remains thin in the reconstructed point cloud, and whether an occlusion contour creates a false slanted surface. Thus, the target of this work is not generic edge detection, but boundary-band metric depth consistency: depth values in a narrow region around true depth jumps should remain metrically reliable.
+
+This local reliability view is especially relevant for control-oriented perception and panoramic surround-view systems. Such systems often fuse multiple camera views or use monocular depth as an auxiliary geometric cue for object contour understanding, free-space reasoning, and local three-dimensional scene reconstruction. In these settings, a boundary error is not merely a visual artifact. A foreground-background leakage region can thicken an object contour, shift an obstacle boundary, or create a false intermediate surface in the reconstructed geometry. A useful boundary-aware depth model should therefore improve the reliability of local metric depth around discontinuities while keeping the global scene scale stable.
+
+This motivates the central question of the paper: can a metric-depth model be made more reliable at object boundaries without sacrificing the global metric scale that makes it useful in the first place? A direct replacement by a large structural depth model is not always ideal, because relative-depth priors may localize edges well but do not necessarily preserve dataset-calibrated metric depth. Conversely, a purely metric-depth model may preserve scale while still smoothing object contours. The proposed solution therefore treats boundary refinement as a constrained residual problem: keep ZoeDepth responsible for the scene-level metric estimate, and allow a small boundary-aware head to correct only the final depth values near likely geometric discontinuities.
+
+This paper proposes BRRH-ZoeDepth, a boundary residual refinement method for metric monocular depth estimation. The method preserves ZoeDepth as the base metric-depth predictor and adds a depth-discontinuity branch, a frozen Depth Anything V2 structural-prior branch, and a Boundary Residual Refinement Head. The key design is to apply a bounded residual in final log-depth space:
+\begin{equation}
+\log \hat{D} = \log D_{\mathrm{base}} + \alpha M_b \tanh(\Delta_b),
+\label{eq:intro_residual}
+\end{equation}
+where $D_{\mathrm{base}}$ is the ZoeDepth base prediction, $M_b$ is a boundary-region mask derived from predicted discontinuity probabilities, $\Delta_b$ is the residual predicted by BRRH, and $\alpha$ controls the correction strength. This formulation keeps the residual local and bounded, making the intervention more direct than feature-level gating while reducing the risk of corrupting non-boundary metric scale.
+
+The contributions of this paper are as follows:
+\begin{itemize}
+  \item A boundary residual refinement framework that targets boundary-band metric depth near depth discontinuities while preserving the ZoeDepth metric-depth base.
+  \item A final log-depth residual head guided by predicted depth-discontinuity probabilities and a frozen Depth Anything V2 structural prior.
+  \item A training objective combining global metric-depth loss, boundary-band depth loss, boundary contrast loss, and non-boundary preservation.
+  \item A KITTI and NYU Depth V2 evaluation with global metrics, boundary-focused metrics, ablations, and external DA-V2/Depth Pro baselines, clarifying where BRRH lowers boundary-local metric errors and where high-resolution structural models remain stronger.
+\end{itemize}
+
+\section{Related Work}
+
+\subsection{Monocular Metric Depth Estimation}
+
+Monocular depth estimation has progressed from early supervised convolutional networks to transformer-based dense prediction models and foundation-style depth systems \cite{dpt}, \cite{midas}, \cite{newcrfs}. Supervised methods optimize dense depth against ground-truth sensor measurements, while self-supervised methods often use stereo or video reconstruction losses. Metric monocular depth estimation is more demanding than relative depth because the output must preserve physical scale. Errors in metric scale can directly affect robot navigation, obstacle distance estimation, and scene reconstruction.
+
+ZoeDepth is a representative metric-depth model that combines robust relative-depth pretraining with metric-depth adaptation \cite{zoedepth}. It inherits the generalization ability of relative depth models and introduces metric bins to adapt the prediction to real depth ranges. This makes ZoeDepth a suitable base for this work: it already provides a stable metric-depth foundation, so the proposed method can focus on the remaining local failure mode at depth discontinuities.
+
+\subsection{Adaptive Depth Bins and Metric Adaptation}
+
+Adaptive binning treats depth prediction as a distribution over candidate depth values rather than pure scalar regression \cite{adabins}, \cite{zoedepth}. This strategy can improve flexibility and can represent different depth ranges more effectively than a fixed uniform discretization. However, depth discontinuities remain challenging because a local region may contain foreground and background hypotheses simultaneously. When the final prediction averages multiple plausible depths, a boundary pixel may receive an unrealistic intermediate value.
+
+The bin-distribution view also explains why boundary pixels need different treatment from smooth surfaces. In smooth regions, a moderate distribution can stabilize noise and preserve surface continuity. Near occlusion contours, however, the model should avoid mixing two physical surfaces. BRRH addresses this issue after the base prediction by correcting final log-depth residuals in boundary regions, while auxiliary boundary-conditioned bin sharpening is used as a mechanism to discourage excessively flat bin distributions near predicted discontinuities.
+
+\subsection{Foundation Depth Models and Structural Priors}
+
+Depth Anything V2 shows that large-scale pretraining and high-quality supervision can produce strong structural depth priors \cite{dav2}. Depth Pro further highlights sharp high-resolution metric depth as an important current research direction \cite{depthpro}. These works motivate the present paper in two ways. First, local structure and boundary sharpness deserve explicit evaluation rather than being treated as visual side effects. Second, large-scale depth priors can be useful even when the target model remains a smaller metric-depth system trained on a specific dataset.
+
+In this paper, Depth Anything V2 is not used as a full metric-depth replacement. Instead, a frozen small DA-V2 branch provides structural guidance while ZoeDepth remains responsible for the metric-depth base. This separation is important because structural relative-depth priors do not automatically guarantee dataset-specific metric scale. It also keeps the training cost lower than fully fine-tuning a large foundation depth model.
+
+\subsection{Depth Boundary Modeling}
+
+Depth boundary modeling is related to but distinct from image-edge detection. RGB edges can arise from texture or lighting changes, whereas depth discontinuities correspond to geometry. Boundary-aware losses, gradient constraints, and edge alignment methods can improve local structure, but they may not directly modify the final metric prediction. If boundary information is injected only as an auxiliary branch, the final depth map may still be dominated by the base decoder and global losses.
+
+BRRH follows a more direct strategy: it uses boundary information to predict a bounded final-depth residual and explicitly optimizes boundary-band depth error. The method therefore targets the numerical depth value around true discontinuities, not only the visual alignment of an edge map.
+
+\section{Proposed Method}
+
+\subsection{Problem Definition and Overview}
+
+Given an RGB image $I \in \mathbb{R}^{3 \times H \times W}$, the model predicts a metric depth map $\hat{D} \in \mathbb{R}^{1 \times H \times W}$. The architecture contains four major components: a ZoeDepth metric-depth base, a depth-discontinuity branch, a frozen Depth Anything V2 structural-prior branch, and the proposed Boundary Residual Refinement Head. ZoeDepth first produces a base metric depth $D_{\mathrm{base}}$. The discontinuity branch predicts a boundary probability map $\hat{B}$. The frozen prior branch supplies structural features. BRRH then predicts a bounded log-depth residual that is applied mainly near predicted discontinuities.
+
+The overall data flow is:
+\begin{equation}
+I \rightarrow F_{\mathrm{z}} \rightarrow
+\{D_{\mathrm{base}},\hat{B},P_{\mathrm{da}},\Delta_b\}
+\rightarrow \hat{D},
+\end{equation}
+where $F_{\mathrm{z}}$ denotes the shared ZoeDepth/DPT feature representation and $P_{\mathrm{da}}$ denotes the frozen DA-V2 structural prior. The design is deliberately conservative: the base model is still responsible for global metric scale, while the new branch is responsible for local boundary-band correction.
+
+\begin{figure*}[t]
+\centering
+\caption{Overview of BRRH-ZoeDepth. The framework preserves ZoeDepth as the metric-depth base and applies a bounded boundary residual guided by predicted discontinuities and a frozen DA-V2 structural prior.}
+\label{fig:architecture}
+\includegraphics[width=\textwidth]{figures/boundary_zoedepth_architecture_ieee.pdf}
+\end{figure*}
+
+\subsection{ZoeDepth Metric Base}
+
+The base branch follows the ZoeDepth prediction principle. Let $c_i$ be the $i$-th metric bin center and $p_i(x)$ be the probability of that bin at pixel $x$. A simplified form of the base prediction is:
+\begin{equation}
+D_{\mathrm{base}}(x)=\sum_{i=1}^{N}p_i(x)c_i.
+\end{equation}
+This representation is more flexible than direct scalar regression because it can represent a distribution over plausible depths. However, near depth discontinuities, this same flexibility can produce foreground-background mixing. If a foreground object and a distant background both influence the local feature, the predicted distribution may place probability mass on multiple bins, and the expectation can become an intermediate depth that corresponds to no actual surface.
+
+BRRH keeps this base prediction instead of replacing it. The reason is that the base provides stable metric scale over KITTI scenes, while the proposed module only needs to intervene in local discontinuity regions. This division of labor reduces the risk that a boundary-oriented module degrades full-image metric consistency.
+
+\subsection{Depth Discontinuity Target and Branch}
+
+The discontinuity branch predicts geometry-related boundary probabilities rather than generic RGB edges. The training target is generated from the ground-truth log-depth gradient. Let $D^*$ be the ground-truth depth and let $\epsilon$ be a small numerical constant. The horizontal and vertical log-depth jumps are:
+\begin{align}
+g_x(x,y) &= |\log(D^*(x,y+1)+\epsilon)-\log(D^*(x,y)+\epsilon)|,\\
+g_y(x,y) &= |\log(D^*(x+1,y)+\epsilon)-\log(D^*(x,y)+\epsilon)|.
+\end{align}
+The soft target is computed by thresholding the maximum local jump with a sigmoid:
+\begin{equation}
+B^*=\sigma(\beta(g-\tau)),
+\label{eq:boundary_target}
+\end{equation}
+where $g=\max(g_x,g_y)$, $\tau$ is the log-gradient threshold, and $\beta$ controls the softness of the boundary target. In the current implementation, $\tau=0.15$ and $\beta=20.0$ by default in the loss module; the submitted BRRH configuration records the same threshold and uses a soft target to avoid unstable hard labels.
+
+Because depth-boundary pixels occupy only a small fraction of the image, the branch is supervised by weighted binary cross entropy:
+\begin{align}
+\mathcal{L}_{cls}
+&=-\frac{1}{|\Omega|}
+\sum_{x\in\Omega} w(x)\Big[
+B^*(x)\log \hat{B}(x) \notag\\
+&\quad +(1-B^*(x))\log(1-\hat{B}(x))
+\Big],
+\end{align}
+where $w(x)=1+(w_p-1)B^*(x)$ and $w_p$ is the positive boundary weight. This prevents the trivial solution of predicting non-boundary everywhere.
+
+\subsection{Boundary-Conditioned Bin Sharpening}
+
+In boundary regions, the model should avoid overly flat depth-bin distributions. The predicted boundary probability is therefore used to sharpen the local bin distribution. Let $z_i(x)$ denote the logit for bin $i$ and $T(x)$ the original temperature. A boundary-conditioned temperature is defined as:
+\begin{equation}
+T'(x)=\frac{T(x)}{1+\lambda_b\hat{B}(x)}.
+\label{eq:temperature}
+\end{equation}
+The resulting probability is:
+\begin{equation}
+p_i'(x)=
+\frac{\exp(z_i(x)/T'(x))}
+{\sum_{j=1}^{N}\exp(z_j(x)/T'(x))}.
+\end{equation}
+When $\hat{B}(x)$ is high, the temperature decreases and the bin distribution becomes sharper. When $\hat{B}(x)$ is low, the distribution remains close to the base behavior. This mechanism reflects the assumption that smooth regions benefit from stable averaging, while discontinuity regions require a more decisive foreground or background depth hypothesis.
+
+\subsection{Frozen Depth Anything V2 Prior}
+
+The DA-V2 branch is used as a structural prior, not as the final metric-depth predictor. During training, the branch is kept in evaluation mode and its parameters are frozen. The forward pass is executed without gradient updates, and its output is projected into a lightweight feature representation:
+\begin{equation}
+P_{\mathrm{da}}=\phi_{\mathrm{proj}}(f_{\mathrm{DA}}(I)).
+\end{equation}
+The frozen design has two advantages. First, it avoids the memory and optimization cost of fully fine-tuning a foundation model. Second, it prevents a relative-depth prior from overwhelming the metric scale learned by ZoeDepth. In BRRH, $P_{\mathrm{da}}$ is used together with base log-depth and boundary probabilities to estimate the residual correction.
+
+\subsection{Boundary Residual Refinement Head}
+
+The central component is BRRH. The head receives a compact input composed of image/context features, base log-depth, boundary probability, and projected DA-V2 prior. It predicts a residual $\Delta_b$ and applies it in log-depth space:
+\begin{align}
+R_b &= \tanh(\Delta_b),\\
+\log \hat{D} &= \log(D_{\mathrm{base}}+\epsilon)+\alpha M_b R_b,\\
+\hat{D} &= \exp(\log \hat{D}),
+\label{eq:brrh}
+\end{align}
+where $M_b$ is a boundary activation mask derived from $\hat{B}$ and $\alpha$ bounds the correction strength. The current model uses $\alpha=0.08$.
+
+Using log-depth has two practical benefits. First, residuals become approximately relative-depth corrections, which are more balanced between near and far regions than absolute depth residuals. Second, multiplicative depth changes become additive in log space, making the correction easier to constrain. The $\tanh$ nonlinearity prevents large residuals, and the mask $M_b$ localizes the correction to discontinuity neighborhoods.
+
+The difference from feature-level gating is important. A feature gate can only influence the final depth through later decoder operations, and the effect may be diluted by the base predictor. BRRH acts directly on the final depth map, so the training losses can supervise the actual corrected metric value in the boundary band.
+
+
+\begin{table}[t]
+\centering
+\small
+\caption{Algorithm 1: Boundary Residual Refinement Head inference.}
+\label{alg:brrh-inference}
+\begin{tabular}{p{0.94\linewidth}}
+\toprule
+\textbf{Input:} RGB image $I$, ZoeDepth base predictor, frozen DA-V2 prior, residual scale $\alpha$, numerical constant $\epsilon$. \\
+\textbf{Output:} refined metric depth $D_t$. \\
+\midrule
+1:\quad Predict base metric depth $D_b$ using the ZoeDepth metric decoder. \\
+2:\quad Estimate discontinuity logits $B$ and compute the soft boundary mask $M_b=\sigma(B)$. \\
+3:\quad Extract frozen DA-V2 structural features $P_{\mathrm{da}}$ under no-gradient inference. \\
+4:\quad Predict residual logits $\Delta_b=\mathrm{BRRH}(D_b,M_b,P_{\mathrm{da}})$. \\
+5:\quad Bound the correction as $R_b=\tanh(\Delta_b)$. \\
+6:\quad Return $D_t=\exp(\log(D_b+\epsilon)+\alpha M_b R_b)$. \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Training Objective}
+
+The final training objective is:
+\begin{align}
+\mathcal{L} &=
+\lambda_{si}\mathcal{L}_{si}
++ \lambda_{edge}\mathcal{L}_{edge}
++ \lambda_{cls}\mathcal{L}_{cls} \notag\\
+&\quad
++ \lambda_{band}\mathcal{L}_{band}
++ \lambda_{contrast}\mathcal{L}_{contrast} \notag\\
+&\quad
++ \lambda_{preserve}\mathcal{L}_{preserve}.
+\label{eq:total_loss}
+\end{align}
+
+\textbf{Scale-invariant depth loss.}
+The global metric-depth term follows the SILog form:
+\begin{equation}
+\mathcal{L}_{si}
+=10\sqrt{\frac{1}{n}\sum_i e_i^2
+-\lambda\left(\frac{1}{n}\sum_i e_i\right)^2},
+\end{equation}
+where $e_i=\log \hat{D}_i-\log D_i^*$ over valid pixels. This term preserves full-image metric accuracy.
+
+\textbf{Edge-aware gradient loss.}
+The gradient term compares predicted and ground-truth log-depth gradients with additional weighting around RGB and ground-truth depth edges. Its role is auxiliary: it supports local structure but is kept at low weight to avoid overfitting texture edges.
+
+\textbf{Boundary-band loss.}
+A boundary band $\Omega_b$ is obtained by dilating the hard ground-truth discontinuity mask. The band loss is:
+\begin{equation}
+\mathcal{L}_{band} =
+\frac{1}{|\Omega_b|}
+\sum_{x\in\Omega_b}
+\left|\log \hat{D}(x)-\log D^*(x)\right|.
+\label{eq:band}
+\end{equation}
+This term is directly aligned with the paper objective because it optimizes final depth values near true discontinuities.
+
+\textbf{Boundary contrast loss.}
+The contrast term penalizes mismatch of log-depth jumps across true boundary pairs:
+\begin{align}
+\mathcal{L}_{contrast}
+&=
+\frac{1}{|\mathcal{E}|}
+\sum_{(u,v)\in\mathcal{E}}
+\Big|
+(\log\hat{D}_u-\log\hat{D}_v) \notag\\
+&\quad
+-(\log D^*_u-\log D^*_v)
+\Big|,
+\end{align}
+where $\mathcal{E}$ contains neighboring pixel pairs whose ground-truth log-depth jump exceeds the discontinuity threshold. This term discourages the false ramp effect that appears when foreground and background depths are averaged.
+
+\textbf{Non-boundary preservation.}
+To keep the residual local, non-boundary pixels are constrained to remain close to the detached base prediction:
+\begin{equation}
+\mathcal{L}_{preserve} =
+\frac{1}{|\Omega_{nb}|}
+\sum_{x\in\Omega_{nb}}
+\left|\log \hat{D}(x)-\log D_{\mathrm{base}}(x)\right|.
+\label{eq:preserve}
+\end{equation}
+The base depth is detached in this term. This is crucial because the loss should restrict the residual head, not force the base predictor to match itself.
+
+The final BRRH configuration uses $\lambda_{edge}=0.02$, $\lambda_{cls}=0.05$, $\lambda_{band}=0.5$, $\lambda_{contrast}=0.15$, and $\lambda_{preserve}=0.05$. These weights reflect a conservative design: the boundary module receives enough supervision to affect discontinuity regions, while the base metric-depth loss remains the dominant global training signal.
+
+\subsection{Implementation Details}
+
+Experiments use KITTI \cite{kitti} with input size $256 \times 512$, micro batch size 4, learning rate $2\times10^{-5}$, and 5 training epochs. The backbone is DPT-BEiT-L. The MiDaS backbone and the Depth Anything V2 small prior are frozen in the reported BRRH setting. Data loading uses 8 workers with pinned memory and persistent workers. The training script records CUDA peak memory through PyTorch memory statistics rather than relying only on external GPU monitoring. Temporary validation and logging tensors are detached before storage to avoid retaining unnecessary autograd graphs.
+
+For the NYU Depth V2 sync validation \cite{nyu}, the same input size and micro batch size are used. The baseline is trained on the NYU sync training split and evaluated on the labeled val654 split. The tuned BRRH validation starts from the NYU-sync BRRH checkpoint and uses a smaller residual scale ($\alpha=0.015$), stronger boundary-band and preservation weights, and a lower DA-V2 fusion scale. This setting is used to test whether the boundary module transfers to an indoor dense-depth dataset without changing the metric-depth backbone.
+
+\section{Experiments and Results}
+
+\subsection{Dataset and Metrics}
+
+Experiments are conducted on KITTI using the Eigen split. The maximum depth is 80 m and evaluation uses the same crop setting as the local evaluation scripts. Global metrics include AbsRel, RMSE, SILog, and $\delta_1$. Boundary-focused metrics include Boundary RMSE, SI-Boundary F1, Edge F1 with spatial tolerance, Top-k high-gradient-region AbsRel, and boundary-band AbsRel.
+
+These metrics measure different properties. Edge F1 evaluates whether predicted depth discontinuity locations match the ground-truth discontinuity map. Boundary RMSE, Top5 AbsRel, and Band3 AbsRel evaluate numerical depth accuracy around boundary regions. The distinction is central to the paper: the verified advantage of BRRH is boundary-band metric accuracy and metric-scale preservation, not universal boundary-location superiority. Reporting both groups avoids the misleading conclusion that a visually sharp boundary map is automatically a better metric-depth map.
+
+The experimental protocol is organized around three questions. First, does the residual formulation reduce boundary-band metric error without damaging global KITTI performance? Second, does the same boundary mechanism remain useful on dense indoor NYU data, where ground-truth depth is denser and object boundaries differ from driving scenes? Third, how should BRRH be interpreted relative to strong structural models such as DA-V2 and Depth Pro? This organization is intended to make the evidence falsifiable: if a model only raises Edge F1 but worsens metric boundary errors, or only lowers global errors while losing boundary behavior, that trade-off must be reported rather than hidden.
+
+\subsection{Main Comparison}
+
+Table~\ref{tab:main-results} reports the main comparison. BRRH 5epoch achieves the best RMSE, SILog, $\delta_1$, and Boundary RMSE among the listed final-stage models. Compared with the previous strong boundary-gated model, BRRH reduces RMSE by 0.019886, SILog by 0.023991, and Boundary RMSE by 0.147439. AbsRel is slightly worse than the previous strong model, so it is described as comparable rather than improved.
+
+\begin{table*}[t]
+\centering
+\small
+\caption{KITTI metric and boundary results. Lower is better for AbsRel, RMSE, SILog, and Boundary RMSE; higher is better for $\delta_1$ and SI-Boundary F1.}
+\label{tab:main-results}
+\begin{tabular}{lrrrrrr}
+\toprule
+Model & AbsRel & RMSE & SILog & $\delta_1$ & SI-Boundary F1 & Boundary RMSE \\
+\midrule
+ZoeDepth baseline & 0.112012 & 4.143466 & 14.200074 & 0.860374 & 0.000434 & 13.065585 \\
+BEiT BoundaryAlign & 0.071562 & 2.849607 & 9.538611 & 0.945925 & 0.004507 & 9.888021 \\
+BEiT + DA gate, scale 0.16 & 0.069550 & 2.821638 & 9.317102 & 0.948274 & 0.004613 & 9.890254 \\
+BEiT + DA gate, scale 0.24 strong & \textbf{0.069443} & 2.821816 & 9.310561 & 0.948463 & \textbf{0.004831} & 9.884354 \\
+BRRH scale 0.24, 2epoch & 0.069856 & 2.809149 & 9.295979 & 0.948422 & 0.004461 & 9.765566 \\
+BRRH scale 0.24, 5epoch & 0.069576 & \textbf{2.801930} & \textbf{9.286570} & \textbf{0.948680} & 0.004519 & \textbf{9.736915} \\
+\bottomrule
+\end{tabular}
+\end{table*}
+
+\subsection{Hard-Boundary Evaluation}
+
+Table~\ref{tab:hard-boundary} reports hard-boundary metrics. BRRH 5epoch obtains the best Top5 AbsRel and Band3 AbsRel, indicating improved depth accuracy in high-gradient and boundary-neighborhood regions. However, the previous strong model has better Edge F1. This distinction is important: BRRH improves metric depth values around boundaries but does not yet provide the strongest boundary-location response.
+
+\begin{table*}[t]
+\centering
+\small
+\caption{Hard-boundary metrics on KITTI.}
+\label{tab:hard-boundary}
+\begin{tabular}{lrrrrrr}
+\toprule
+Model & AbsRel & RMSE & Edge F1@3 & Edge F1@5 & Top5 AbsRel & Band3 AbsRel \\
+\midrule
+scale 0.16 full & 0.069550 & 2.821638 & 0.025317 & 0.034292 & 0.150040 & 0.153955 \\
+scale 0.16 no gate & 0.069621 & 2.819728 & 0.025397 & 0.033453 & 0.149790 & 0.153793 \\
+scale 0.24 strong & \textbf{0.069443} & 2.821816 & \textbf{0.025636} & \textbf{0.034755} & 0.150177 & 0.153893 \\
+BRRH scale 0.24, 2epoch & 0.069856 & 2.809149 & 0.022681 & 0.030135 & 0.149321 & 0.153120 \\
+BRRH scale 0.24, 5epoch & 0.069576 & \textbf{2.801930} & 0.023091 & 0.030732 & \textbf{0.148862} & \textbf{0.152965} \\
+\bottomrule
+\end{tabular}
+\end{table*}
+
+\subsection{NYU Depth V2 Sync Validation}
+
+To test whether the boundary refinement module is tied only to KITTI, an additional experiment is conducted on NYU Depth V2. The NYU sync training split is used for training and the labeled val654 split is used for validation. Table~\ref{tab:nyu-sync} reports the comparison between the NYU-sync ZoeDepth baseline, the direct BRRH configuration, and the tuned BRRH configuration.
+
+The tuned BRRH model keeps global metric accuracy close to the baseline: AbsRel changes from 0.063734 to 0.063668 and RMSE from 0.283944 m to 0.283864 m. The main gain is in depth-edge localization. Edge F1@3 improves from 0.246453 to 0.262029, and Edge F1@5 improves from 0.280163 to 0.297239. These correspond to relative improvements of 6.32\% and 6.10\%, respectively. Boundary RMSE is slightly worse than the baseline, increasing from 0.596803 m to 0.599826 m. Therefore, the NYU result supports the claim that BRRH is useful as a structure-aware edge localization module while preserving metric accuracy, but it does not support a stronger claim of universal boundary-error improvement on indoor scenes.
+
+\begin{table*}[t]
+\centering
+\small
+\caption{NYU Depth V2 sync validation on the labeled val654 split. Lower is better for AbsRel, RMSE, Boundary RMSE, and Band3 AbsRel; higher is better for $\delta_1$ and Edge F1.}
+\label{tab:nyu-sync}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{lrrrrrrr}
+\toprule
+Model & AbsRel & RMSE & $\delta_1$ & Boundary RMSE & Band3 AbsRel & Edge F1@3 & Edge F1@5 \\
+\midrule
+NYU-sync ZoeDepth baseline & 0.063734 & 0.283944 & \textbf{0.955504} & \textbf{0.596803} & \textbf{0.127238} & 0.246453 & 0.280163 \\
+NYU-sync BRRH & 0.063804 & \textbf{0.283798} & 0.955282 & 0.598622 & 0.127462 & 0.257107 & 0.291898 \\
+NYU-sync BRRH tuned & \textbf{0.063668} & 0.283864 & 0.955331 & 0.599826 & 0.127332 & \textbf{0.262029} & \textbf{0.297239} \\
+\bottomrule
+\end{tabular}%
+}
+\end{table*}
+
+\subsection{Boundary-Density Subset Evaluation}
+
+To further test whether the NYU improvement is concentrated in scenes with more depth discontinuities, the val654 split is divided into three equally sized subsets according to the ground-truth log-depth boundary pixel fraction. Table~\ref{tab:nyu-density} reports the low-, medium-, and high-boundary-density results. The tuned BRRH model improves Edge F1 in all three groups. The relative Edge F1@3 gains are especially visible in the low- and medium-density subsets, increasing from 0.083119 to 0.168240 and from 0.276641 to 0.406304, respectively. In the high-density subset, Edge F1@3 increases from 0.379600 to 0.497156.
+
+However, the same table also shows that the metric-depth error terms become slightly worse in the density subsets. For example, in the high-density subset, Boundary RMSE changes from 0.813153 m to 0.847197 m and Band3 AbsRel changes from 0.154661 to 0.159596. This supports the central diagnostic conclusion of this paper: boundary localization and boundary-region metric-value accuracy are not identical objectives. The current NYU-tuned BRRH setting acts primarily as a structure-aware edge-localization refinement, while KITTI BRRH provides stronger boundary-band metric-error gains.
+
+\begin{table*}[t]
+\centering
+\small
+\caption{NYU val654 boundary-density subset evaluation. The split uses tertiles of the ground-truth log-depth boundary pixel fraction. Each subset contains 218 samples.}
+\label{tab:nyu-density}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{llrrrrr}
+\toprule
+Subset & Model & Density & AbsRel & Boundary RMSE & Band3 AbsRel & Edge F1@3 \\
+\midrule
+Low & Baseline & 0.002603 & 0.054432 & 0.399341 & 0.099874 & 0.083119 \\
+Low & BRRH tuned & 0.002603 & 0.055842 & 0.418057 & 0.103170 & 0.168240 \\
+Medium & Baseline & 0.007990 & 0.061844 & 0.577914 & 0.127179 & 0.276641 \\
+Medium & BRRH tuned & 0.007990 & 0.064190 & 0.604499 & 0.131870 & 0.406304 \\
+High & Baseline & 0.018002 & 0.079080 & 0.813153 & 0.154661 & 0.379600 \\
+High & BRRH tuned & 0.018002 & 0.081998 & 0.847197 & 0.159596 & 0.497156 \\
+\bottomrule
+\end{tabular}%
+}
+\end{table*}
+
+\subsection{External Strong Baselines}
+
+A strict comparison should also ask whether strong external depth models can replace the proposed refinement pipeline. Therefore, two external baselines are evaluated on the same NYU labeled val654 split. Depth Anything V2 small is evaluated as a relative-depth baseline: since the Hugging Face model does not provide calibrated metric depth, inverse prediction mode is used and the prediction is median-aligned to the valid ground-truth region before applying the same crop and boundary metrics. These DA-V2 metric values should therefore be interpreted as aligned relative-depth diagnostics, not as native metric-depth output. Depth Pro is evaluated with its official checkpoint as a strong sharp metric-depth reference and uses the same NYU split, crop, median alignment, and boundary metric implementation.
+
+Table~\ref{tab:nyu-dav2-external} shows a clear trade-off. DA-V2 small obtains the highest Edge F1, which confirms its strong structural edge prior, but after relative-to-metric alignment its depth-value errors remain much larger. Depth Pro also obtains much stronger Edge F1 than the NYU-trained ZoeDepth and BRRH models, confirming that high-resolution sharp-depth models remain a hard boundary-localization reference. However, under this matched NYU validation protocol, NYU-sync BRRH tuned keeps lower AbsRel, RMSE, Boundary RMSE, and Band3 AbsRel than Depth Pro. This supports the design decision used in BRRH-ZoeDepth: DA-V2 is valuable as a frozen structural guide, while ZoeDepth remains responsible for calibrated metric depth. It also clarifies the present contribution: BRRH is a low-cost boundary-aware refinement inside a ZoeDepth-style metric pipeline, not a replacement for high-resolution foundation depth models.
+
+\begin{table*}[t]
+\centering
+\small
+\caption{External baselines on NYU Depth V2 labeled val654. DA-V2 is evaluated as a relative-depth model with inverse output and median alignment; Depth Pro is evaluated with its official checkpoint under the same validation protocol.}
+\label{tab:nyu-dav2-external}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{lrrrrrrr}
+\toprule
+Model & AbsRel & RMSE & $\delta_1$ & Boundary RMSE & Band3 AbsRel & Edge F1@3 & Edge F1@5 \\
+\midrule
+DA-V2 small, inverse + median align & 0.324498 & 1.634566 & 0.542391 & 1.931904 & 0.419636 & \textbf{0.555114} & \textbf{0.615943} \\
+Depth Pro, median align & 0.065344 & 0.299016 & 0.947743 & 0.610032 & 0.131140 & 0.510074 & 0.560036 \\
+NYU-sync ZoeDepth baseline & 0.063734 & 0.283944 & \textbf{0.955504} & \textbf{0.596803} & \textbf{0.127238} & 0.246453 & 0.280163 \\
+NYU-sync BRRH tuned & \textbf{0.063668} & \textbf{0.283864} & 0.955331 & 0.599826 & 0.127332 & 0.262029 & 0.297239 \\
+\bottomrule
+\end{tabular}%
+}
+\end{table*}
+
+\subsection{Alignment Sensitivity of External Models}
+
+Table~\ref{tab:alignment-sensitivity} reports an additional alignment sensitivity test for DA-V2 small and Depth Pro on NYU val654. DA-V2 is highly sensitive to metric alignment because it is a relative-depth model. Without median alignment, DA-V2 inverse prediction has AbsRel 0.739940 and RMSE 1.995706; with median alignment, these improve to 0.324498 and 1.634566. Its Edge F1 remains high in both cases. Depth Pro is less sensitive than DA-V2 but still benefits from median alignment: AbsRel changes from 0.103067 to 0.065344 and RMSE from 0.389038 m to 0.299016 m, while Edge F1@3 remains essentially unchanged around 0.510.
+
+This result reinforces the interpretation of the external baselines. Strong structural models can localize depth discontinuities very well, and this property is relatively insensitive to a global scale alignment. Metric-depth error, however, depends strongly on the calibration protocol. Therefore, BRRH is compared as a native ZoeDepth-style metric pipeline, while DA-V2 and Depth Pro are used as structural references and alignment-sensitive external baselines rather than direct replacements.
+
+\begin{table*}[t]
+\centering
+\small
+\caption{Alignment sensitivity of external NYU val654 baselines. DA-V2 uses inverse relative-depth prediction; Depth Pro uses the official checkpoint.}
+\label{tab:alignment-sensitivity}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{llrrrrr}
+\toprule
+Model & Alignment & AbsRel & RMSE & Boundary RMSE & Band3 AbsRel & Edge F1@3 \\
+\midrule
+DA-V2 small inverse & None & 0.739940 & 1.995706 & 2.103797 & 0.729926 & 0.547311 \\
+DA-V2 small inverse & Median & 0.324498 & 1.634566 & 1.931904 & 0.419636 & 0.555114 \\
+Depth Pro & None & 0.103067 & 0.389038 & 0.650106 & 0.151303 & 0.510052 \\
+Depth Pro & Median & 0.065344 & 0.299016 & 0.610032 & 0.131140 & 0.510074 \\
+BRRH tuned & Native metric & 0.063668 & 0.283864 & 0.599826 & 0.127332 & 0.262029 \\
+\bottomrule
+\end{tabular}%
+}
+\end{table*}
+
+\begin{figure*}[t]
+\centering
+\caption{NYU Depth V2 qualitative comparison. The selected validation samples show cases where BRRH reduces boundary-band AbsRel relative to the ZoeDepth baseline while preserving the metric-depth layout; Depth Pro is included as a high-resolution structural reference.}
+\label{fig:nyu-depthpro-qualitative}
+\includegraphics[width=\textwidth]{figures/nyu_brrh_depthpro_top_samples_ieee.png}
+\end{figure*}
+
+Figure~\ref{fig:nyu-depthpro-qualitative} visualizes the trade-off measured in Table~\ref{tab:nyu-dav2-external}. For the selected NYU validation samples, BRRH reduces boundary-band AbsRel relative to the ZoeDepth baseline by 0.012012, 0.009022, and 0.007137, respectively. Depth Pro has stronger visual contour sharpness in several regions and obtains lower boundary-band AbsRel on two of the three selected examples, but one example shows higher boundary-band error than BRRH. This qualitative result supports the paper's conservative interpretation: BRRH should be viewed as a low-cost residual correction for ZoeDepth-style metric pipelines, while Depth Pro remains a stronger high-resolution structural reference.
+
+\begin{figure*}[t]
+\centering
+\caption{KITTI qualitative ablation for the final residual head. Full BRRH reduces the selected sample's boundary-band error relative to the no-residual variant while keeping the global depth layout visually stable.}
+\label{fig:brrh-noresidual-qualitative}
+\includegraphics[width=\textwidth]{figures/brrh_noresidual_qualitative_ieee.png}
+\end{figure*}
+
+Figure~\ref{fig:brrh-noresidual-qualitative} provides a qualitative example for the ablation. The residual head does not create a visually different global depth layout, which is expected because the correction is bounded and localized. Its effect is instead visible in the boundary-band error map and in the reduced band AbsRel for the selected sample. This agrees with the numerical trend in Table~\ref{tab:ablation}: the residual head mainly improves boundary-region metric accuracy rather than producing a dramatic full-image appearance change.
+
+\subsection{Matched Ablation Study}
+
+Table~\ref{tab:ablation} reports ablations for the final BRRH configuration. Removing the final residual head produces the weakest RMSE, Boundary RMSE, Top5 AbsRel, and Band3 AbsRel among the listed variants, which supports the main design choice of applying a direct log-depth correction near discontinuities. Removing boundary-conditioned temperature sharpening worsens RMSE, SILog, Boundary RMSE, Top5 AbsRel, and Band3 AbsRel, indicating that discontinuity-conditioned bin sharpening contributes to the boundary-band metric improvement. Removing the frozen DA-V2 prior slightly improves AbsRel but worsens RMSE, SILog, $\delta_1$, Boundary RMSE, Top5 AbsRel, and Band3 AbsRel. This indicates that the prior does not simply improve every global score, but it helps the residual head produce more reliable boundary-band metric corrections. Removing only the boundary-band loss improves some global scores, such as AbsRel and SILog, but worsens Boundary RMSE, Top5 AbsRel, and Band3 AbsRel. This result is consistent with the loss design: the band term is not intended to optimize the easiest full-image average metrics, but to protect the narrow discontinuity neighborhood. Removing only the contrast loss has a small effect on the current 5-epoch result: RMSE and boundary-band AbsRel remain close to the full model, while Boundary RMSE is marginally lower. Therefore, in the present setting, the contrast term is best interpreted as an auxiliary geometric regularizer rather than the dominant source of the boundary-band gain. Removing all boundary losses further degrades the boundary-focused metrics, confirming that boundary-specific supervision is useful for the intended region. Removing the non-boundary preservation term changes the result only marginally; it slightly improves $\delta_1$ and SILog but has worse RMSE and boundary-band errors than the full BRRH model. Thus, the preservation term is best interpreted as a conservative regularizer rather than the main source of improvement.
+
+\begin{table*}[t]
+\centering
+\small
+\caption{Ablation study for the BRRH configuration on KITTI. The no-residual-head row is evaluated from the latest checkpoint saved during epoch 5 and is used as a diagnostic ablation.}
+\label{tab:ablation}
+\begin{tabular}{lrrrrrr}
+\toprule
+Model & AbsRel & RMSE & SILog & Boundary RMSE & Top5 AbsRel & Band3 AbsRel \\
+\midrule
+BRRH without DA-V2 prior & \textbf{0.069338} & 2.815605 & 9.312119 & 9.800231 & 0.149684 & 0.153540 \\
+BRRH without temperature sharpening & 0.069647 & 2.808266 & 9.296610 & 9.753557 & 0.149348 & 0.153257 \\
+BRRH without boundary-band loss & 0.069343 & 2.814760 & 9.280347 & 9.857267 & 0.150022 & 0.153908 \\
+BRRH without contrast loss & 0.069551 & 2.802217 & 9.284953 & \textbf{9.734903} & 0.148916 & \textbf{0.152928} \\
+BRRH without boundary losses & 0.069431 & 2.816039 & \textbf{9.276458} & 9.861277 & 0.150195 & 0.153841 \\
+BRRH without preservation & 0.069506 & 2.804027 & 9.281278 & 9.742943 & 0.149018 & 0.152978 \\
+BRRH without residual head$^*$ & 0.070253 & 2.826934 & 9.316874 & 9.832706 & 0.149933 & 0.153879 \\
+Full BRRH & 0.069576 & \textbf{2.801930} & 9.286570 & 9.736915 & \textbf{0.148862} & 0.152965 \\
+\bottomrule
+\end{tabular}
+\end{table*}
+
+\subsection{Complexity and Deployment Cost}
+
+Table~\ref{tab:complexity} reports a local parameter-count profile for the baseline and BRRH configurations used in the main KITTI experiment. The ZoeDepth backbone is frozen in this setting, so the number of trainable parameters is much smaller than the total model size. BRRH increases the trainable parameter count from 0.482M to 0.564M. The added trainable boundary modules, including the residual head, discontinuity head, and DA-fusion layers, contain only 0.081M parameters. The larger total-parameter increase comes from the frozen Depth Anything V2 prior, which contributes 24.786M parameters but is not optimized during training. This supports the intended positioning of BRRH as a lightweight trainable refinement module guided by a fixed structural prior, rather than a full replacement of the metric-depth backbone.
+
+\begin{table*}[t]
+\centering
+\small
+\caption{Parameter-count profile for the KITTI baseline and BRRH configurations. The frozen DA prior is reported separately because it provides structural guidance but is not trained.}
+\label{tab:complexity}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{lrrrrrrr}
+\toprule
+Variant & Total Params & Trainable Params & Boundary Refiner & Discontinuity Head & DA Fuser & Frozen DA Prior & Added Trainable Modules \\
+\midrule
+ZoeDepth baseline & 344.820M & 0.482M & 0.000M & 0.000M & 0.000M & 0.000M & 0.000M \\
+BRRH-ZoeDepth & 369.687M & 0.564M & 0.013M & 0.057M & 0.011M & 24.786M & 0.081M \\
+\bottomrule
+\end{tabular}
+}
+\end{table*}
+
+\subsection{Method Evolution}
+
+The method evolved from edge refinement and discontinuity prediction to boundary alignment, DA-V2 prior injection, boundary gating, and finally BRRH. Early boundary-aware variants improved the original ZoeDepth baseline substantially. The previous strong boundary-gated model achieved the best AbsRel and Edge F1 among the local variants, but its feature-level gating affected the final depth only indirectly. BRRH changes this design by directly correcting the final log-depth. This explains why BRRH improves RMSE, SILog, Boundary RMSE, Top5 AbsRel, and Band3 AbsRel even though Edge F1 is not improved.
+
+\section{Discussion}
+
+The results support a conservative conclusion: BRRH is useful for boundary-aware metric depth behavior, but the type of improvement depends on the dataset and metric. Edge F1 evaluates the spatial alignment of predicted and ground-truth depth edges, whereas Boundary RMSE, Top5 AbsRel, and Band3 AbsRel evaluate depth values around discontinuity regions. On KITTI, BRRH lowers the boundary-band metric-error group but does not outperform the previous strong boundary-gated model on Edge F1. On NYU Depth V2, the tuned BRRH model improves Edge F1 while leaving Boundary RMSE slightly worse than the baseline. The boundary-density subset experiment makes this trade-off explicit: BRRH raises Edge F1 in low-, medium-, and high-density subsets, but the metric error terms slightly increase. This difference suggests that boundary localization and boundary metric-value correction are related but not identical objectives. A future version should explicitly balance these two targets, for example by using a multi-task boundary objective or a bimodal boundary-depth representation.
+
+The method should also be distinguished from Depth Anything V2 and Depth Pro. Depth Anything V2 is used as a frozen structural prior, not as the final metric-depth predictor. The direct DA-V2 NYU baseline confirms this distinction: it gives strong boundary localization, but its metric-depth values are much less accurate than the NYU-trained ZoeDepth and BRRH models under the matched evaluation. Depth Pro demonstrates the importance of sharp metric boundaries and is a strong reference model. In the matched NYU diagnostic evaluation, Depth Pro substantially outperforms BRRH on Edge F1, while BRRH keeps slightly lower AbsRel, RMSE, Boundary RMSE, and Band3 AbsRel. The alignment sensitivity experiment further shows that DA-V2 and Depth Pro edge localization is relatively stable under median alignment, while their metric-depth errors change substantially. Therefore, the present paper should not claim overall superiority over Depth Pro. Instead, its claim is narrower: BRRH provides a trainable, low-cost boundary refinement mechanism for ZoeDepth-style metric pipelines. A broader future comparison should additionally evaluate Depth Pro and BRRH under high-resolution input settings, cross-dataset testing, and identical metric scaling protocols.
+
+For downstream perception, the useful interpretation is therefore not that BRRH is the sharpest available depth model. The useful interpretation is that a metric-depth pipeline can be given an explicit boundary-correction path with limited trainable cost and bounded influence on the final prediction. This makes the design relevant when the system already depends on a calibrated metric-depth backbone but needs additional reliability around object contours, occlusion boundaries, and thin structures. In panoramic or surround-view perception, such a module can serve as an auxiliary geometric refinement stage before point-cloud projection, obstacle-contour analysis, or multi-view fusion. The present experiments do not validate a complete control system, but they isolate and evaluate the boundary-depth behavior that such systems would depend on.
+
+\section{Limitations and Future Work}
+
+The first limitation is supervision quality. The KITTI experiments use sparse LiDAR-derived depth and driving-scene data, so depth-discontinuity labels can be incomplete around thin structures, reflective surfaces, and distant object contours. This affects both the discontinuity branch and the residual head. Stronger boundary supervision from synthetic data, denser datasets, or multi-dataset training may improve boundary-location F1 and reduce the gap to high-resolution structural models.
+
+The second limitation is input-resolution sensitivity. The NYU resolution diagnostic shows that the current checkpoints should be evaluated near their training resize. At 256x512 and 320x640, BRRH preserves an Edge F1 advantage over the ZoeDepth baseline, but an aggressive 192x384 resize damages metric accuracy for both models. Therefore, deployment should keep the input resolution close to the training setting or use resolution-aware calibration.
+
+The third limitation is the single-mode residual formulation. At true occlusion boundaries, a pixel may contain mixed foreground-background evidence, and a single corrected depth value may not fully represent this ambiguity. Future work should explore bimodal or mixture-based boundary-depth distributions, stronger occlusion-aware objectives, and confidence-aware fusion between metric-depth and structural-prior predictions.
+
+\section{Conclusions}
+
+This paper presented BRRH-ZoeDepth, a boundary residual refinement method for metric monocular depth estimation. The method preserves ZoeDepth as the metric-depth base and applies bounded log-depth residual correction near predicted depth discontinuities, guided by a frozen Depth Anything V2 structural prior and trained with boundary-band and non-boundary preservation losses. On KITTI, the 5-epoch BRRH model lowers RMSE, SILog, Boundary RMSE, Top5 AbsRel, and Band3 AbsRel and slightly raises $\delta_1$ compared with the previous strong boundary-gated model. On NYU Depth V2 sync validation, a tuned BRRH model raises Edge F1@3 and Edge F1@5 while preserving AbsRel and RMSE, showing that the boundary module can transfer to dense indoor data as a structure-aware refinement component. Boundary-density and alignment-sensitivity experiments further clarify the evidence: BRRH raises NYU edge localization scores across density subsets, while DA-V2 and Depth Pro show strong edge localization but alignment-sensitive metric errors. The current limitation is that Edge F1 and boundary-magnitude errors do not improve together in all settings, and the current checkpoints should be used near their intended inference resolution. Future work will add stronger balanced boundary objectives, evaluate additional datasets, and explore stronger boundary-distribution modeling.
+
+
+\section*{Data and Code Availability}
+
+The experiments use the public KITTI and NYU Depth V2 datasets under their respective dataset terms. The implementation, training configurations, evaluation scripts, metric logs, and checkpoints are available from the corresponding author upon reasonable request. A public GitHub repository can be added before final submission after repository creation.
+
+\bibliographystyle{IEEEtran}
+\bibliography{references}
+
+\EOD
+
+\end{document}
